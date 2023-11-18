@@ -1,14 +1,16 @@
-mod edges;
+mod bridge_finder;
 mod graph;
-mod graph2;
 mod input;
 mod node;
-use graph::Graph;
-mod bridges;
 mod union_find;
 
+use crate::{graph::Graph, node::Node};
+use bridge_finder::BridgeFinder;
+use union_find::UnionFind;
+
+#[allow(unused_variables)]
 fn main() -> anyhow::Result<()> {
-    let mut graph = Graph::new();
+    let mut graph = Graph::new(200000);
     let records = input::parse("./data.csv")?;
     let nodes = records
         .iter()
@@ -16,20 +18,35 @@ fn main() -> anyhow::Result<()> {
             record
                 .node_values()
                 .into_iter()
-                .map(|(kind, value)| node::Node::new(kind, value).expect("Invalid node"))
-                .collect::<Vec<node::Node>>()
+                .map(|(kind, value)| Node::new(kind, value).expect("Invalid node"))
+                .collect::<Vec<Node>>()
         })
-        .collect::<Vec<Vec<node::Node>>>();
+        .collect::<Vec<Vec<Node>>>();
 
     for group in nodes.iter() {
-        graph.add_connected_graph(group);
+        graph.add_connected_component(group);
     }
 
-    dbg!(&graph.nodes().len());
+    // Set the number of components
+    graph.components = graph.nodes().len();
 
-    let bridges = bridges::find(&graph);
+    // Find and remove valid bridges from the graph
+    let bridges = graph.find_bridges();
+    for bridge in bridges {
+        graph.remove_edge(&bridge.from, &bridge.to);
+        graph.remove_edge(&bridge.to, &bridge.from);
+    }
 
-    dbg!(bridges.len());
+    // Run Union Find on the graph, showing the starting and ending components
+    dbg!(&graph.components);
+    let nodes = graph.edges.keys().cloned().collect::<Vec<Node>>();
+    nodes.into_iter().for_each(|node| {
+        let adjacent_nodes = graph.adjacent_nodes(&node);
+        for adjacent_node in adjacent_nodes {
+            graph.union(&node, &adjacent_node)
+        }
+    });
+    dbg!(&graph.components);
 
     Ok(())
 }

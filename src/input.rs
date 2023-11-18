@@ -33,19 +33,23 @@ where
 }
 
 impl Record {
-    pub fn group_id(&self) -> Option<&str> {
+    pub fn group_id(&self) -> Option<String> {
         canonicalise(&self.group_id)
     }
 
-    pub fn account_number(&self) -> Option<&str> {
+    pub fn account_number(&self) -> Option<String> {
         canonicalise(&self.account_number)
     }
 
-    pub fn abn(&self) -> Option<&str> {
-        canonicalise(&self.abn)
+    pub fn abn(&self) -> Option<String> {
+        if let Some(str) = canonicalise(&self.abn) {
+            validate_abn(str)
+        } else {
+            None
+        }
     }
 
-    pub fn domain(&self) -> Option<&str> {
+    pub fn domain(&self) -> Option<String> {
         // Discard any generic domains
         if self.generic_domain {
             return None;
@@ -53,7 +57,7 @@ impl Record {
         canonicalise(&self.domain)
     }
 
-    pub fn node_values(&self) -> Vec<(&str, &str)> {
+    pub fn node_values(&self) -> Vec<(&str, String)> {
         let mut values = vec![];
         if let Some(group_id) = self.group_id() {
             values.push(("group_id", group_id));
@@ -71,11 +75,45 @@ impl Record {
     }
 }
 
-fn canonicalise(s: &str) -> Option<&str> {
+fn canonicalise(s: &str) -> Option<String> {
     if s == "NULL" || s.is_empty() {
         None
     } else {
-        Some(s)
+        // Remove all whitespace
+        let canonical_string = s.replace(' ', "").trim().to_lowercase();
+        Some(canonical_string)
+    }
+}
+
+const ABN_WEIGHTS: [usize; 11] = [10, 1, 3, 5, 7, 9, 11, 13, 15, 17, 19];
+
+pub fn validate_abn(s: String) -> Option<String> {
+    // Discard invalid length
+    if s.len() != 11 {
+        return None;
+    }
+
+    let digits = s
+        .chars()
+        .filter_map(|c| c.to_digit(10))
+        .map(|d| d as usize)
+        .collect::<Vec<usize>>();
+
+    let sum = digits
+        .iter()
+        .zip(ABN_WEIGHTS.iter())
+        .enumerate()
+        .map(|(i, (d, w))| match i {
+            0 => (d - 1) * w,
+            _ => d * w,
+        })
+        .sum::<usize>();
+
+    let remainder = sum % 89;
+    if remainder == 0 {
+        Some(digits.iter().map(|d| d.to_string()).collect::<String>())
+    } else {
+        None
     }
 }
 
@@ -90,4 +128,25 @@ pub fn parse(filename: &str) -> anyhow::Result<Vec<Record>> {
     }
 
     Ok(records)
+}
+
+#[cfg(test)]
+mod test {
+
+    #[test]
+    fn test_valid_abn() {
+        let valid_abn = "11365315258";
+
+        assert_eq!(
+            super::validate_abn(valid_abn.to_string()),
+            Some(valid_abn.to_string())
+        );
+    }
+
+    #[test]
+    fn test_invalid_abn() {
+        let invalid_abn = "11365315259";
+
+        assert_eq!(super::validate_abn(invalid_abn.to_string()), None);
+    }
 }

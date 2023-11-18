@@ -1,35 +1,11 @@
 use anyhow::anyhow;
-use std::rc::Rc;
 
-#[derive(Debug, PartialEq, Hash, Eq, Clone)]
-pub struct Node {
-    kind: NodeKind,
-    value: Rc<str>,
-}
-
-#[derive(Debug, PartialEq, Hash, Eq, Clone)]
+#[derive(Debug, Hash, Clone, PartialEq, Eq)]
 pub enum NodeKind {
     AccountNumber,
     Domain,
     Abn,
     GroupId,
-}
-
-impl Node {
-    pub fn new(kind: &str, value: &str) -> anyhow::Result<Self> {
-        if value == "NULL" || value.is_empty() {
-            return Err(anyhow!("Invalid node value: {}", value));
-        };
-
-        let kind = NodeKind::try_from(kind)?;
-        let value = value.into();
-
-        Ok(Node { kind, value })
-    }
-
-    pub fn value(&self) -> &str {
-        &self.value
-    }
 }
 
 impl TryFrom<&str> for NodeKind {
@@ -43,5 +19,20 @@ impl TryFrom<&str> for NodeKind {
             "group_id" => Ok(NodeKind::GroupId),
             other => Err(anyhow!("Unknown node kind: {}", other)),
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Hash, Eq, Clone)]
+pub struct Node {
+    pub kind: NodeKind,
+    pub value: String,
+}
+
+impl Node {
+    pub fn new(kind: &str, value: String) -> anyhow::Result<Self> {
+        Ok(Node {
+            kind: NodeKind::try_from(kind)?,
+            value,
+        })
     }
 }
