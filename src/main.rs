@@ -40,11 +40,10 @@ fn main() -> anyhow::Result<()> {
     // Run Union Find on the graph, showing the starting and ending components
     dbg!(&graph.components);
     let nodes = graph.edges.keys().cloned().collect::<Vec<Node>>();
-    nodes.into_iter().for_each(|node| {
-        let adjacent_nodes = graph.adjacent_nodes(&node);
-        for adjacent_node in adjacent_nodes {
-            graph.union(&node, &adjacent_node)
-        }
+    nodes.iter().for_each(|node| {
+        graph.adjacent_nodes(node).iter().for_each(|adjacent_node| {
+            graph.union(node, adjacent_node);
+        });
     });
     dbg!(&graph.components);
 
