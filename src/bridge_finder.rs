@@ -1,80 +1,187 @@
-use std::collections::{HashMap, HashSet};
+use crate::graph::Graph;
+use crate::node::NodeId;
 
-use super::{Graph, Node};
+/// Sentinel "no parent" marker for DFS roots. Node ids are dense indices well
+/// below `u32::MAX`, so this never collides with a real id.
+const NO_PARENT: NodeId = NodeId::MAX;
+const UNVISITED: u32 = u32::MAX;
 
-#[derive(Debug)]
-pub struct Bridge {
-    pub from: Node,
-    pub to: Node,
+/// One entry of the explicit DFS stack, replacing the recursive call frame.
+struct Frame {
+    node: NodeId,
+    parent: NodeId,
+    /// Weight of the tree edge from `parent` to `node` (unused for roots).
+    parent_weight: u32,
+    /// Index of the next neighbour of `node` to visit.
+    next: usize,
 }
 
-#[derive(Debug)]
-pub struct BridgeFinderState {
-    pub visited: HashSet<Node>,
-    pub low: HashMap<Node, usize>,
-    pub discovery: HashMap<Node, usize>,
-    pub parent: HashMap<Node, Node>,
-    pub bridges: Vec<Bridge>,
-}
+/// Finds the *valid* bridges of `graph` using an iterative Tarjan low-link DFS.
+///
+/// A bridge is an edge whose removal disconnects the graph. We keep only the
+/// bridges worth cutting for entity resolution: those asserted by a single
+/// record (`weight == 1`) whose **both** endpoints have other connections
+/// (`degree > 1`), so cutting them separates two genuine clusters rather than
+/// orphaning a leaf identifier.
+///
+/// The DFS is iterative (an explicit `Vec` stack) so it cannot overflow the
+/// call stack on deep components, and it uses a single global discovery
+/// counter — the canonical formulation.
+pub fn find_valid_bridges(graph: &Graph) -> Vec<(NodeId, NodeId)> {
+    let n = graph.num_nodes();
+    let mut disc = vec![UNVISITED; n];
+    let mut low = vec![UNVISITED; n];
+    let mut timer: u32 = 0;
+    let mut bridges = Vec::new();
+    let mut stack: Vec<Frame> = Vec::new();
 
-impl BridgeFinderState {
-    pub fn new(nodes: Vec<&Node>) -> BridgeFinderState {
-        let num_nodes = nodes.len();
-        BridgeFinderState {
-            visited: HashSet::with_capacity(num_nodes),
-            low: HashMap::with_capacity(num_nodes),
-            discovery: HashMap::with_capacity(num_nodes),
-            parent: HashMap::with_capacity(num_nodes),
-            // We know roughly how big this will be
-            bridges: Vec::with_capacity(5000),
+    for start in 0..n as NodeId {
+        if disc[start as usize] != UNVISITED {
+            continue;
         }
-    }
-}
 
-pub trait BridgeFinder {
-    fn find_bridges(&self) -> Vec<Bridge>;
-    fn is_valid_bridge(&self, bridge: &Bridge) -> bool;
+        disc[start as usize] = timer;
+        low[start as usize] = timer;
+        timer += 1;
+        stack.push(Frame {
+            node: start,
+            parent: NO_PARENT,
+            parent_weight: 0,
+            next: 0,
+        });
 
-    fn dfs(
-        &self,
-        graph: &Graph,
-        current: Node,
-        parent: Node,
-        time: usize,
-        state: &mut BridgeFinderState,
-    ) {
-        state.visited.insert(current.clone());
-        state.discovery.insert(current.clone(), time);
-        state.low.insert(current.clone(), time);
+        while let Some(frame) = stack.last_mut() {
+            let u = frame.node;
+            let neighbors = graph.neighbors(u);
 
-        for next in graph.adjacent_nodes(&current) {
-            if next.clone() == parent {
-                continue;
-            }
+            if frame.next < neighbors.len() {
+                let (v, weight) = neighbors[frame.next];
+                frame.next += 1;
 
-            if !state.visited.contains(&next) {
-                self.dfs(graph, next.clone(), current.clone(), time + 1, state);
-                state
-                    .low
-                    .insert(current.clone(), state.low[&current].min(state.low[&next]));
+                // The single edge back to the parent is the tree edge, not a
+                // back edge — skip it once.
+                if v == frame.parent {
+                    continue;
+                }
 
-                // TODO: Check if the bridges are valid
-                if state.low[&next] > state.discovery[&current] {
-                    let bridge = Bridge {
-                        from: current.clone(),
-                        to: next.clone(),
-                    };
-
-                    if self.is_valid_bridge(&bridge) {
-                        state.bridges.push(bridge);
-                    };
+                if disc[v as usize] == UNVISITED {
+                    // Tree edge: descend into v.
+                    disc[v as usize] = timer;
+                    low[v as usize] = timer;
+                    timer += 1;
+                    stack.push(Frame {
+                        node: v,
+                        parent: u,
+                        parent_weight: weight,
+                        next: 0,
+                    });
+                } else {
+                    // Back edge: v is an ancestor; pull its discovery time into low[u].
+                    low[u as usize] = low[u as usize].min(disc[v as usize]);
                 }
             } else {
-                state.low.insert(
-                    current.clone(),
-                    state.low[&current].min(state.discovery[&next]),
-                );
+                // Finished u: pop it and fold its low-link into its parent,
+                // testing the parent→u tree edge for being a bridge.
+                let done = stack.pop().unwrap();
+                if let Some(parent_frame) = stack.last() {
+                    let p = parent_frame.node;
+                    low[p as usize] = low[p as usize].min(low[u as usize]);
+
+                    let is_bridge = low[u as usize] > disc[p as usize];
+                    let is_valid =
+                        done.parent_weight == 1 && graph.degree(p) > 1 && graph.degree(u) > 1;
+                    if is_bridge && is_valid {
+                        bridges.push((p.min(u), p.max(u)));
+                    }
+                }
             }
         }
+    }
+
+    bridges
+}
+
+#[cfg(test)]
+mod test {
+    use super::find_valid_bridges;
+    use crate::graph::GraphBuilder;
+
+    fn sorted(mut v: Vec<(u32, u32)>) -> Vec<(u32, u32)> {
+        v.sort_unstable();
+        v
+    }
+
+    #[test]
+    fn triangle_has_no_bridges() {
+        let mut b = GraphBuilder::new(3);
+        b.add_clique(&[0, 1, 2]);
+        assert!(find_valid_bridges(&b.build()).is_empty());
+    }
+
+    #[test]
+    fn clique_of_four_has_no_bridges() {
+        let mut b = GraphBuilder::new(4);
+        b.add_clique(&[0, 1, 2, 3]);
+        assert!(find_valid_bridges(&b.build()).is_empty());
+    }
+
+    #[test]
+    fn leaf_edges_are_structural_bridges_but_not_valid() {
+        // Path 0-1-2: every bridge has a degree-1 endpoint, so none are valid.
+        let mut b = GraphBuilder::new(3);
+        b.add_clique(&[0, 1]);
+        b.add_clique(&[1, 2]);
+        assert!(find_valid_bridges(&b.build()).is_empty());
+    }
+
+    #[test]
+    fn interior_bridge_with_two_real_endpoints_is_valid() {
+        // Path 0-1-2-3: only the middle edge (1,2) has degree>1 on both ends.
+        let mut b = GraphBuilder::new(4);
+        b.add_clique(&[0, 1]);
+        b.add_clique(&[1, 2]);
+        b.add_clique(&[2, 3]);
+        assert_eq!(find_valid_bridges(&b.build()), vec![(1, 2)]);
+    }
+
+    #[test]
+    fn single_weak_link_between_clusters_is_a_valid_bridge() {
+        // Two triangles joined by one weight-1 edge (2,3).
+        let mut b = GraphBuilder::new(6);
+        b.add_clique(&[0, 1, 2]);
+        b.add_clique(&[3, 4, 5]);
+        b.add_clique(&[2, 3]);
+        assert_eq!(find_valid_bridges(&b.build()), vec![(2, 3)]);
+    }
+
+    #[test]
+    fn double_asserted_link_is_not_a_valid_bridge() {
+        // Same join, but two records assert (2,3): weight 2, so not cut.
+        let mut b = GraphBuilder::new(6);
+        b.add_clique(&[0, 1, 2]);
+        b.add_clique(&[3, 4, 5]);
+        b.add_clique(&[2, 3]);
+        b.add_clique(&[2, 3]);
+        assert!(find_valid_bridges(&b.build()).is_empty());
+    }
+
+    #[test]
+    fn isolated_nodes_have_no_bridges() {
+        let mut b = GraphBuilder::new(3);
+        b.add_clique(&[0]);
+        assert!(find_valid_bridges(&b.build()).is_empty());
+    }
+
+    #[test]
+    fn finds_bridges_across_multiple_components() {
+        // Two independent "two-triangles-joined" components in one graph.
+        let mut b = GraphBuilder::new(12);
+        b.add_clique(&[0, 1, 2]);
+        b.add_clique(&[3, 4, 5]);
+        b.add_clique(&[2, 3]);
+        b.add_clique(&[6, 7, 8]);
+        b.add_clique(&[9, 10, 11]);
+        b.add_clique(&[8, 9]);
+        assert_eq!(sorted(find_valid_bridges(&b.build())), vec![(2, 3), (8, 9)]);
     }
 }

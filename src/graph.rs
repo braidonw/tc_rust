@@ -1,140 +1,121 @@
-use std::collections::HashMap;
+use crate::node::NodeId;
+use rustc_hash::FxHashMap;
 
-use crate::{
-    bridge_finder::{Bridge, BridgeFinder, BridgeFinderState},
-    node::Node,
-    union_find::UnionFind,
-};
-
+/// Undirected weighted graph of identifier nodes, stored as adjacency lists
+/// indexed by `NodeId`. An edge's weight is the number of records that
+/// co-asserted that pair of identifiers; it is built once and then read-only.
 #[derive(Debug)]
 pub struct Graph {
-    pub edges: HashMap<Node, HashMap<Node, usize>>,
-    pub roots: HashMap<Node, Node>,
-    pub sizes: HashMap<Node, usize>,
-    pub components: usize,
+    /// `adjacency[id]` holds `(neighbor, weight)` for every edge incident to `id`.
+    adjacency: Vec<Vec<(NodeId, u32)>>,
 }
 
 impl Graph {
-    pub fn new(size: usize) -> Self {
-        Graph {
-            edges: HashMap::with_capacity(size),
-            roots: HashMap::with_capacity(size),
-            sizes: HashMap::new(),
-            components: 0,
+    pub fn num_nodes(&self) -> usize {
+        self.adjacency.len()
+    }
+
+    pub fn neighbors(&self, id: NodeId) -> &[(NodeId, u32)] {
+        &self.adjacency[id as usize]
+    }
+
+    pub fn degree(&self, id: NodeId) -> usize {
+        self.adjacency[id as usize].len()
+    }
+
+    /// Yields each undirected edge once as `(a, b, weight)` with `a < b`.
+    pub fn edges(&self) -> impl Iterator<Item = (NodeId, NodeId, u32)> + '_ {
+        self.adjacency
+            .iter()
+            .enumerate()
+            .flat_map(|(a, neighbors)| {
+                let a = a as NodeId;
+                neighbors
+                    .iter()
+                    .filter(move |(b, _)| a < *b)
+                    .map(move |&(b, w)| (a, b, w))
+            })
+    }
+}
+
+/// Accumulates edge weights across records, then freezes them into a `Graph`.
+/// Weights are keyed by the canonical ordered pair `(min, max)` so the two
+/// directions of an undirected edge share one counter.
+#[derive(Debug)]
+pub struct GraphBuilder {
+    num_nodes: usize,
+    edges: FxHashMap<(NodeId, NodeId), u32>,
+}
+
+impl GraphBuilder {
+    pub fn new(num_nodes: usize) -> Self {
+        GraphBuilder {
+            num_nodes,
+            edges: FxHashMap::default(),
         }
     }
 
-    pub fn nodes(&self) -> Vec<&Node> {
-        self.edges.keys().collect::<Vec<&Node>>()
-    }
-
-    pub fn add_connected_component(&mut self, nodes: &[Node]) {
-        for node in nodes {
-            for other_node in nodes {
-                if node == other_node {
+    /// Adds a record's identifiers as a clique: every distinct pair gets its
+    /// weight bumped by one. The ids within a record are already distinct (one
+    /// per `NodeKind`), so the `a == b` guard is just defensive.
+    pub fn add_clique(&mut self, ids: &[NodeId]) {
+        for (i, &a) in ids.iter().enumerate() {
+            for &b in &ids[i + 1..] {
+                if a == b {
                     continue;
                 }
-                self.add_edge(node, other_node);
+                let key = if a < b { (a, b) } else { (b, a) };
+                *self.edges.entry(key).or_insert(0) += 1;
             }
-            self.roots.insert(node.clone(), node.clone());
         }
     }
 
-    fn add_edge(&mut self, from: &Node, to: &Node) {
-        let edges = self.edges.entry(from.clone()).or_insert(HashMap::new());
-        let weight = edges.entry(to.clone()).or_insert(0);
-        *weight += 1;
-    }
-
-    pub fn remove_edge(&mut self, from: &Node, to: &Node) {
-        let edges = self.edges.get_mut(from).unwrap();
-        edges.remove(to);
-    }
-
-    pub fn adjacent_nodes(&self, node: &Node) -> Vec<Node> {
-        self.edges
-            .get(node)
-            .map(|edges| edges.keys().cloned().collect())
-            .unwrap_or_default()
+    pub fn build(self) -> Graph {
+        let mut adjacency = vec![Vec::new(); self.num_nodes];
+        for ((a, b), weight) in self.edges {
+            adjacency[a as usize].push((b, weight));
+            adjacency[b as usize].push((a, weight));
+        }
+        Graph { adjacency }
     }
 }
 
-impl BridgeFinder for Graph {
-    fn find_bridges(&self) -> Vec<Bridge> {
-        let mut state = BridgeFinderState::new(self.nodes());
-        for (time, node) in self.nodes().into_iter().enumerate() {
-            self.dfs(self, node.clone(), node.clone(), time, &mut state);
-        }
+#[cfg(test)]
+mod test {
+    use super::GraphBuilder;
 
-        state.bridges
+    #[test]
+    fn clique_creates_all_pairs() {
+        let mut b = GraphBuilder::new(3);
+        b.add_clique(&[0, 1, 2]);
+        let g = b.build();
+        assert_eq!(g.degree(0), 2);
+        assert_eq!(g.degree(1), 2);
+        assert_eq!(g.degree(2), 2);
+        assert_eq!(g.edges().count(), 3);
     }
 
-    fn is_valid_bridge(&self, bridge: &Bridge) -> bool {
-        let edge_weight = self
-            .edges
-            .get(&bridge.from)
-            .and_then(|edges| edges.get(&bridge.to))
-            // We know the edge exists, so unwrap is fine
-            .expect("Edge weight not found");
-
-        // Want to make sure that the weight of the edge between the two nodes is 1
-        let edge_weight_is_one = *edge_weight == 1;
-
-        let from_has_many_edges = self.edges.get(&bridge.from).unwrap().len() > 1;
-        let to_has_many_edges = self.edges.get(&bridge.to).unwrap().len() > 1;
-
-        edge_weight_is_one && from_has_many_edges && to_has_many_edges
-    }
-}
-
-impl UnionFind<Node> for Graph {
-    fn find(&mut self, node: &Node) -> Node {
-        let mut root = node.clone();
-
-        loop {
-            if root == self.roots[&root] {
-                break;
-            }
-
-            root = self.roots[&root].clone();
-        }
-
-        // Path compression
-        let mut original = node.clone();
-        loop {
-            if original == root {
-                break;
-            }
-
-            let next = self.roots[node].clone();
-            self.roots.insert(node.clone(), root.clone());
-            original = next;
-        }
-
-        root
+    #[test]
+    fn shared_identifier_accumulates_weight() {
+        // Two records both assert the pair (0, 1); a third asserts (1, 2) once.
+        let mut b = GraphBuilder::new(3);
+        b.add_clique(&[0, 1]);
+        b.add_clique(&[0, 1]);
+        b.add_clique(&[1, 2]);
+        let g = b.build();
+        let edge_01 = g.edges().find(|&(a, c, _)| a == 0 && c == 1).unwrap();
+        assert_eq!(edge_01.2, 2);
+        let edge_12 = g.edges().find(|&(a, c, _)| a == 1 && c == 2).unwrap();
+        assert_eq!(edge_12.2, 1);
     }
 
-    fn union(&mut self, node1: &Node, node2: &Node) {
-        let root1 = self.find(node1);
-        let root2 = self.find(node2);
-
-        if root1 == root2 {
-            return;
-        }
-
-        let root1_size = *self.sizes.entry(root1.clone()).or_insert(1);
-        let root2_size = *self.sizes.entry(root2.clone()).or_insert(1);
-
-        let new_size = root1_size + root2_size;
-
-        if root1_size <= root2_size {
-            self.roots.insert(root1.clone(), root2.clone());
-            self.sizes.insert(root2, new_size);
-        } else {
-            self.roots.insert(root2.clone(), root1.clone());
-            self.sizes.insert(root1, new_size);
-        }
-
-        self.components -= 1;
+    #[test]
+    fn isolated_node_has_no_edges() {
+        let mut b = GraphBuilder::new(2);
+        b.add_clique(&[0]); // single-identifier record: no edges
+        let g = b.build();
+        assert_eq!(g.degree(0), 0);
+        assert_eq!(g.num_nodes(), 2);
+        assert_eq!(g.edges().count(), 0);
     }
 }

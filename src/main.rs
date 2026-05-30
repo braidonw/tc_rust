@@ -2,50 +2,174 @@ mod bridge_finder;
 mod graph;
 mod input;
 mod node;
+mod output;
 mod union_find;
 
-use crate::{graph::Graph, node::Node};
-use bridge_finder::BridgeFinder;
+use bridge_finder::find_valid_bridges;
+use graph::GraphBuilder;
+use node::{Interner, NodeId};
+use rustc_hash::FxHashSet;
 use union_find::UnionFind;
 
-#[allow(unused_variables)]
+const INPUT_PATH: &str = "./data.csv";
+const ENTITIES_PATH: &str = "./entities.csv";
+const RECORDS_PATH: &str = "./records.csv";
+
 fn main() -> anyhow::Result<()> {
-    let mut graph = Graph::new(200000);
-    let records = input::parse("./data.csv")?;
-    let nodes = records
-        .iter()
-        .map(|record| {
-            record
-                .node_values()
-                .into_iter()
-                .map(|(kind, value)| Node::new(kind, value).expect("Invalid node"))
-                .collect::<Vec<Node>>()
-        })
-        .collect::<Vec<Vec<Node>>>();
+    let records = input::parse(INPUT_PATH)?;
 
-    for group in nodes.iter() {
-        graph.add_connected_component(group);
+    // Intern every identifier to a dense id, and remember each record's ids so
+    // we can build the graph and map records back to entities later.
+    let mut interner = Interner::with_capacity(200_000);
+    let mut record_ids = Vec::with_capacity(records.len());
+    let mut record_nodes: Vec<Vec<NodeId>> = Vec::with_capacity(records.len());
+    for record in &records {
+        let ids = record
+            .node_values()
+            .into_iter()
+            .map(|(kind, value)| interner.intern(kind, value))
+            .collect::<Vec<NodeId>>();
+        record_ids.push(record.id.clone());
+        record_nodes.push(ids);
     }
 
-    // Set the number of components
-    graph.components = graph.nodes().len();
-
-    // Find and remove valid bridges from the graph
-    let bridges = graph.find_bridges();
-    for bridge in bridges {
-        graph.remove_edge(&bridge.from, &bridge.to);
-        graph.remove_edge(&bridge.to, &bridge.from);
+    // Build the identifier graph: each record's ids form a weighted clique.
+    let mut builder = GraphBuilder::new(interner.len());
+    for ids in &record_nodes {
+        builder.add_clique(ids);
     }
+    let graph = builder.build();
 
-    // Run Union Find on the graph, showing the starting and ending components
-    dbg!(&graph.components);
-    let nodes = graph.edges.keys().cloned().collect::<Vec<Node>>();
-    nodes.iter().for_each(|node| {
-        graph.adjacent_nodes(node).iter().for_each(|adjacent_node| {
-            graph.union(node, adjacent_node);
-        });
-    });
-    dbg!(&graph.components);
+    // Find the weak links to cut.
+    let bridges = find_valid_bridges(&graph);
+    let bridge_set: FxHashSet<(NodeId, NodeId)> = bridges.iter().copied().collect();
+
+    // Components before cutting: union over every edge.
+    let mut uf_before = UnionFind::new(interner.len());
+    for (a, b, _) in graph.edges() {
+        uf_before.union(a, b);
+    }
+    let components_before = uf_before.count();
+
+    // Components after cutting: union over every edge except the valid bridges.
+    let mut uf = UnionFind::new(interner.len());
+    for (a, b, _) in graph.edges() {
+        if bridge_set.contains(&(a, b)) {
+            continue;
+        }
+        uf.union(a, b);
+    }
+    let components_after = uf.count();
+
+    let isolated = (0..interner.len() as NodeId)
+        .filter(|&id| graph.degree(id) == 0)
+        .count();
+    let skipped = record_nodes.iter().filter(|ids| ids.is_empty()).count();
+
+    println!("records read:          {}", records.len());
+    println!("  with no identifiers: {skipped} (skipped)");
+    println!("identifiers (nodes):   {}", interner.len());
+    println!("  isolated:            {isolated}");
+    println!("valid bridges cut:     {}", bridges.len());
+    println!("entities before cut:   {components_before}");
+    println!("entities after cut:    {components_after}");
+
+    output::write(
+        &interner,
+        &mut uf,
+        &record_ids,
+        &record_nodes,
+        ENTITIES_PATH,
+        RECORDS_PATH,
+    )?;
+    println!("wrote {ENTITIES_PATH} and {RECORDS_PATH}");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod test {
+    use crate::bridge_finder::find_valid_bridges;
+    use crate::graph::GraphBuilder;
+    use crate::node::{Interner, NodeId, NodeKind};
+    use crate::union_find::UnionFind;
+
+    /// Exercises the whole pipeline (intern → build → cut → count) on a handful
+    /// of records: a chain of three records linked by shared identifiers plus a
+    /// fourth single-identifier record. Confirms the two key fixes — the weak
+    /// interior link is cut, and the isolated single-identifier entity is counted.
+    #[test]
+    fn end_to_end_links_cuts_and_counts() {
+        let records = [
+            vec![(NodeKind::GroupId, "g1"), (NodeKind::Abn, "a1")],
+            vec![(NodeKind::Abn, "a1"), (NodeKind::Domain, "d1")], // shares a1
+            vec![(NodeKind::Domain, "d1"), (NodeKind::AccountNumber, "c1")], // shares d1
+            vec![(NodeKind::GroupId, "solo")],                     // single identifier
+        ];
+
+        let mut interner = Interner::with_capacity(8);
+        let record_nodes: Vec<Vec<NodeId>> = records
+            .iter()
+            .map(|nodes| {
+                nodes
+                    .iter()
+                    .map(|&(kind, value)| interner.intern(kind, value.to_string()))
+                    .collect()
+            })
+            .collect();
+
+        // Five distinct identifiers: g1, a1, d1, c1, solo.
+        assert_eq!(interner.len(), 5);
+
+        let mut builder = GraphBuilder::new(interner.len());
+        for ids in &record_nodes {
+            builder.add_clique(ids);
+        }
+        let graph = builder.build();
+
+        // The graph is the path g1-a1-d1-c1 plus isolated `solo`; the interior
+        // edge a1-d1 is the only valid bridge.
+        let bridges = find_valid_bridges(&graph);
+        let a1 = interner_id(&records, &record_nodes, NodeKind::Abn, "a1");
+        let d1 = interner_id(&records, &record_nodes, NodeKind::Domain, "d1");
+        assert_eq!(bridges, vec![(a1.min(d1), a1.max(d1))]);
+
+        let count = |skip: bool| {
+            let mut uf = UnionFind::new(interner.len());
+            for (x, y, _) in graph.edges() {
+                if skip && bridges.contains(&(x, y)) {
+                    continue;
+                }
+                uf.union(x, y);
+            }
+            uf.count()
+        };
+
+        // Before cutting: one chain + the isolated node = 2 entities.
+        assert_eq!(count(false), 2);
+        // After cutting the weak link: {g1,a1}, {d1,c1}, {solo} = 3 entities.
+        assert_eq!(count(true), 3);
+
+        let isolated = (0..interner.len() as NodeId)
+            .filter(|&id| graph.degree(id) == 0)
+            .count();
+        assert_eq!(isolated, 1);
+    }
+
+    // Finds the interned id of a given identifier by replaying the intern order.
+    fn interner_id(
+        records: &[Vec<(NodeKind, &str)>],
+        record_nodes: &[Vec<NodeId>],
+        kind: NodeKind,
+        value: &str,
+    ) -> NodeId {
+        for (rec, ids) in records.iter().zip(record_nodes) {
+            for (&(k, v), &id) in rec.iter().zip(ids) {
+                if k == kind && v == value {
+                    return id;
+                }
+            }
+        }
+        panic!("identifier not found");
+    }
 }
