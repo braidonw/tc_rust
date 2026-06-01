@@ -9,6 +9,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 - Test: `cargo test`
 - Single test: `cargo test interior_bridge_with_two_real_endpoints_is_valid`
 - Lint: `cargo clippy`; format: `cargo fmt`
+- `justfile` shortcuts: `just test` (= `cargo t`), `just build` (= `cargo b --release`), `just run` (builds, then runs the release binary `./target/release/tc-rust`).
 
 ## What this does
 
